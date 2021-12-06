@@ -1,2 +1,2 @@
-# conformer
-TensorFlow 2.0 Implementation of Conformer
+# Conformer: Convolution-augmented Transformer for Speech Recognition
+TensorFlow 2.0 Implementation of Conformer (WIP)
