@@ -307,9 +307,9 @@ class RelativeMultiHeadAttention(layers.Layer):
 
         if masks is not None:
             masks = masks[:, :, tf.newaxis, tf.newaxis]
-            score = tf.where(tf.cast(masks, dtype=tf.bool), score, 1e-9)
+            score = tf.where(tf.cast(masks, dtype=tf.bool), score, -1e9)
 
-        attn = tf.nn.softmax(score, -1)
+        attn = tf.nn.softmax(score, 1)
         attn = self.dropout(attn, training=training)
         attn = tf.transpose(tf.matmul(attn, value), (0, 2, 1, 3))
         attn = tf.reshape(attn, (batch_size, -1, self._d_model))
