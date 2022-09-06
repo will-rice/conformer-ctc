@@ -242,157 +242,114 @@ class RelativeMultiHeadAttention(layers.Layer):
     """Transformer-XL Attention."""
 
     def __init__(
-        self, d_model: int, num_heads: int, dropout: float = 0.0, **kwargs: Any
+        self,
+        d_model: int = 192,
+        num_heads: int = 2,
+        attn_dropout: float = 0.1,
+        dropout: float = 0.1,
+        init_std=0.01,
+        layer_norm_eps: float = 1e-5,
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._d_model = d_model
         self._d_head = d_model // num_heads
         self._num_heads = num_heads
-        self._sqrt_dim = math.sqrt(d_model)
+        self.scale = 1 / (self._d_head**0.5)
 
-        self.query_proj = layers.Dense(d_model)
-        self.key_proj = layers.Dense(d_model)
-        self.value_proj = layers.Dense(d_model)
-        self.pos_proj = layers.Dense(d_model, use_bias=False)
+        self.query_proj = layers.Dense(
+            d_model, kernel_initializer=get_initializer(init_std)
+        )
+        self.key_proj = layers.Dense(
+            d_model, kernel_initializer=get_initializer(init_std)
+        )
+        self.value_proj = layers.Dense(
+            d_model, kernel_initializer=get_initializer(init_std)
+        )
+        self.attn_dropout = layers.Dropout(attn_dropout)
 
+        self.out_proj = layers.Dense(
+            d_model, kernel_initializer=get_initializer(init_std), use_bias=False
+        )
         self.dropout = layers.Dropout(dropout)
-
-        self.out_proj = layers.Dense(d_model)
+        self.layer_norm = layers.LayerNormalization(epsilon=layer_norm_eps)
 
     def build(self, input_shape: tf.TensorShape) -> None:
         """Build Layer."""
         self.u_bias = self.add_weight(
             name="u_bias",
             shape=(self._num_heads, self._d_head),
-            initializer="glorot_uniform",
+            initializer="zeros",
             trainable=True,
         )
         self.v_bias = self.add_weight(
             name="v_bias",
             shape=(self._num_heads, self._d_head),
-            initializer="glorot_uniform",
+            initializer="zeros",
             trainable=True,
         )
         super().build(input_shape)
 
     def call(
         self,
-        inputs: Tensor,
-        pos_embedding: Tensor,
-        masks: Optional[Tensor] = None,
+        inputs: tf.Tensor,
+        pos_embed: tf.Tensor,
+        mask=None,
         training: bool = False,
     ) -> None:
         """Forward Pass."""
-        batch_size = tf.shape(inputs)[0]
+        input_shape = tf.shape(inputs)
 
+        inputs = self.layer_norm(inputs)
         query = self.query_proj(inputs)
         key = self.key_proj(inputs)
         value = self.value_proj(inputs)
 
-        query = tf.reshape(query, (batch_size, -1, self._num_heads, self._d_head))
-        key = tf.reshape(key, (batch_size, -1, self._num_heads, self._d_head))
-        value = tf.reshape(value, (batch_size, -1, self._num_heads, self._d_head))
+        query = tf.reshape(query, (input_shape[0], -1, self._num_heads, self._d_head))
+        key = tf.reshape(key, (input_shape[0], -1, self._num_heads, self._d_head))
+        value = tf.reshape(value, (input_shape[0], -1, self._num_heads, self._d_head))
+        pos_embed = tf.reshape(
+            pos_embed, (input_shape[0], -1, self._num_heads, self._d_head)
+        )
 
-        pos_embedding = self.pos_proj(pos_embedding)
-        pos_embedding = tf.reshape(
-            pos_embedding, (batch_size, -1, self._num_heads, self._d_head)
-        )
-        content = query + self.u_bias
-        content_score = tf.matmul(content, tf.transpose(key, (0, 1, 3, 2)))
-        pos_score = tf.matmul(
-            query + self.v_bias, tf.transpose(pos_embedding, (0, 1, 3, 2))
-        )
+        content_score = tf.einsum("bind,bjnd->bijn", query + self.u_bias, key)
+
+        pos_score = tf.einsum("bind,bjnd->bijn", query + self.v_bias, pos_embed)
         pos_score = self._rel_shift(pos_score)
-        score = (content_score + pos_score) / self._sqrt_dim
+        # [bsz x qlen x klen x n_head]
+        score = content_score + pos_score
+        score = score * self.scale
 
-        if masks is not None:
-            masks = masks[:, :, tf.newaxis, tf.newaxis]
-            score = tf.where(tf.cast(masks, dtype=tf.bool), score, -1e9)
+        if mask is not None:
+            mask = mask[..., tf.newaxis]
+            # apply softmax mask
+            score = tf.where(mask == 0.0, tf.float32.min, score)
 
-        attn = tf.nn.softmax(score, 1)
-        attn = self.dropout(attn, training=training)
-        attn = tf.transpose(tf.matmul(attn, value), (0, 2, 1, 3))
-        attn = tf.reshape(attn, (batch_size, -1, self._d_model))
+        # apply softmax across sequence axis
+        attn = tf.nn.softmax(score, 2)
+        attn = self.attn_dropout(attn, training=training)
+        attn = tf.einsum("bijn,bjnd->bind", attn, value)
+        attn = tf.reshape(
+            attn, (input_shape[0], input_shape[1], self._num_heads * self._d_head)
+        )
         out = self.out_proj(attn)
-        return out
-
-    @staticmethod
-    def _rel_shift(inputs: Tensor) -> Tensor:
-        input_shape = tf.shape(inputs)
-
-        inputs = tf.pad(inputs, [[0, 0], [1, 0], [0, 0], [0, 0]])
-        inputs = tf.reshape(
-            inputs, [input_shape[1] + 1, input_shape[0], input_shape[2], input_shape[3]]
-        )
-        inputs = tf.slice(inputs, [1, 0, 0, 0], [-1, -1, -1, -1])
-        inputs = tf.reshape(inputs, input_shape)
-        return inputs
-
-    def get_config(self):
-        config = super().get_config()
-        config.update(
-            {
-                "d_model": self._d_model,
-                "d_head": self._d_head,
-                "num_heads": self._num_heads,
-                "sqrt_dim": self._sqrt_dim,
-            }
-        )
-        return config
-
-
-class MultiHeadedSelfAttention(layers.Layer):
-    """MHSA."""
-
-    def __init__(
-        self,
-        d_model: int,
-        num_attention_heads: int,
-        attention_dropout: float = 0.0,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(**kwargs)
-        self._d_model = d_model
-        self._num_attention_heads = num_attention_heads
-        self._attention_dropout = attention_dropout
-
-        self.positional_encoding = RelativePositionEmbedding(d_model)
-        self.layer_norm = layers.LayerNormalization()
-        self.attention = RelativeMultiHeadAttention(
-            d_model=d_model, num_heads=num_attention_heads, dropout=attention_dropout
-        )
-        self.dropout = layers.Dropout(attention_dropout)
-
-    def call(
-        self,
-        inputs: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        training: bool = False,
-    ) -> Tensor:
-        """Forward Pass."""
-        batch_size = tf.shape(inputs)[0]
-
-        pos_embedding = self.positional_encoding(inputs)[tf.newaxis, :, :]
-        pos_embedding = tf.tile(pos_embedding, (batch_size, 1, 1))
-
-        out = self.layer_norm(inputs)
-        out = self.attention(
-            out, pos_embedding=pos_embedding, masks=attention_mask, training=training
-        )
-        out = self.dropout(out, training=training)
-
+        out = self.dropout(out)
         return out + inputs
 
-    def get_config(self):
-        config = super().get_config()
-        config.update(
-            {
-                "d_model": self._d_model,
-                "num_attention_heads": self._num_attention_heads,
-                "attention_dropout": self._attention_dropout,
-            }
-        )
-        return config
+    @staticmethod
+    def _rel_shift(x):
+        # batch_size, q_len, k_len, n_heads
+        x = tf.transpose(x, (2, 0, 1, 3))
+
+        x_size = tf.shape(x)
+
+        x = tf.pad(x, [[0, 0], [1, 0], [0, 0], [0, 0]])
+        x = tf.reshape(x, [x_size[1] + 1, x_size[0], x_size[2], x_size[3]])
+        x = tf.slice(x, [1, 0, 0, 0], [-1, -1, -1, -1])
+        x = tf.reshape(x, x_size)
+        x = tf.transpose(x, (1, 0, 2, 3))
+
+        return x
 
 
 class ConformerBlock(layers.Layer):
